@@ -1,74 +1,90 @@
-import Combine
 import ComposableArchitecture
 import SwiftUI
+import XCTestDynamicOverlay
 
 private let readMe = """
   This application demonstrates how to handle long-living effects, for example notifications from \
-  Notification Center.
+  Notification Center, and how to tie an effect's lifetime to the lifetime of the view.
 
   Run this application in the simulator, and take a few screenshots by going to \
   *Device › Screenshot* in the menu, and observe that the UI counts the number of times that \
   happens.
 
   Then, navigate to another screen and take screenshots there, and observe that this screen does \
-  *not* count those screenshots.
+  *not* count those screenshots. The notifications effect is automatically cancelled when leaving \
+  the screen, and restarted when entering the screen.
   """
 
-// MARK: - Application domain
+// MARK: - Feature domain
 
-struct LongLivingEffectsState: Equatable {
-  var screenshotCount = 0
-}
+@Reducer
+struct LongLivingEffects {
+  struct State: Equatable {
+    var screenshotCount = 0
+  }
 
-enum LongLivingEffectsAction {
-  case userDidTakeScreenshotNotification
-  case onAppear
-  case onDisappear
-}
+  enum Action {
+    case task
+    case userDidTakeScreenshotNotification
+  }
 
-struct LongLivingEffectsEnvironment {
-  var notificationCenter: NotificationCenter
-}
+  @Dependency(\.screenshots) var screenshots
 
-// MARK: - Business logic
+  var body: some Reducer<State, Action> {
+    Reduce { state, action in
+      switch action {
+      case .task:
+        // When the view appears, start the effect that emits when screenshots are taken.
+        return .run { send in
+          for await _ in await self.screenshots() {
+            await send(.userDidTakeScreenshotNotification)
+          }
+        }
 
-let longLivingEffectsReducer = Reducer<
-  LongLivingEffectsState, LongLivingEffectsAction, LongLivingEffectsEnvironment
-> { state, action, environment in
-
-  enum UserDidTakeScreenshotNotificationId {}
-
-  switch action {
-  case .userDidTakeScreenshotNotification:
-    state.screenshotCount += 1
-    return .none
-
-  case .onAppear:
-    // When the view appears, start the effect that emits when screenshots are taken.
-    return environment.notificationCenter
-      .publisher(for: UIApplication.userDidTakeScreenshotNotification)
-      .map { _ in LongLivingEffectsAction.userDidTakeScreenshotNotification }
-      .eraseToEffect()
-      .cancellable(id: UserDidTakeScreenshotNotificationId.self)
-
-  case .onDisappear:
-    // When view disappears, stop the effect.
-    return .cancel(id: UserDidTakeScreenshotNotificationId.self)
+      case .userDidTakeScreenshotNotification:
+        state.screenshotCount += 1
+        return .none
+      }
+    }
   }
 }
 
-// MARK: - SwiftUI view
+extension DependencyValues {
+  var screenshots: @Sendable () async -> AsyncStream<Void> {
+    get { self[ScreenshotsKey.self] }
+    set { self[ScreenshotsKey.self] = newValue }
+  }
+}
+
+private enum ScreenshotsKey: DependencyKey {
+  static let liveValue: @Sendable () async -> AsyncStream<Void> = {
+    await AsyncStream(
+      NotificationCenter.default
+        .notifications(named: UIApplication.userDidTakeScreenshotNotification)
+        .map { _ in }
+    )
+  }
+  static let testValue: @Sendable () async -> AsyncStream<Void> = unimplemented(
+    #"@Dependency(\.screenshots)"#, placeholder: .finished
+  )
+}
+
+// MARK: - Feature view
 
 struct LongLivingEffectsView: View {
-  let store: Store<LongLivingEffectsState, LongLivingEffectsAction>
+  @State var store = Store(initialState: LongLivingEffects.State()) {
+    LongLivingEffects()
+  }
 
   var body: some View {
-    WithViewStore(self.store) { viewStore in
+    WithViewStore(self.store, observe: { $0 }) { viewStore in
       Form {
-        Section(header: Text(template: readMe, .body)) {
-          Text("A screenshot of this screen has been taken \(viewStore.screenshotCount) times.")
-            .font(.headline)
+        Section {
+          AboutView(readMe: readMe)
         }
+
+        Text("A screenshot of this screen has been taken \(viewStore.screenshotCount) times.")
+          .font(.headline)
 
         Section {
           NavigationLink(destination: self.detailView) {
@@ -76,9 +92,8 @@ struct LongLivingEffectsView: View {
           }
         }
       }
-      .navigationBarTitle("Long-living effects")
-      .onAppear { viewStore.send(.onAppear) }
-      .onDisappear { viewStore.send(.onDisappear) }
+      .navigationTitle("Long-living effects")
+      .task { await viewStore.send(.task).finish() }
     }
   }
 
@@ -90,6 +105,7 @@ struct LongLivingEffectsView: View {
       """
     )
     .padding(.horizontal, 64)
+    .navigationBarTitleDisplayMode(.inline)
   }
 }
 
@@ -98,13 +114,9 @@ struct LongLivingEffectsView: View {
 struct EffectsLongLiving_Previews: PreviewProvider {
   static var previews: some View {
     let appView = LongLivingEffectsView(
-      store: Store(
-        initialState: LongLivingEffectsState(),
-        reducer: longLivingEffectsReducer,
-        environment: LongLivingEffectsEnvironment(
-          notificationCenter: .default
-        )
-      )
+      store: Store(initialState: LongLivingEffects.State()) {
+        LongLivingEffects()
+      }
     )
 
     return Group {

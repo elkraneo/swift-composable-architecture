@@ -3,64 +3,58 @@ import ComposableArchitecture
 import SwiftUI
 import UIKit
 
-struct EagerNavigationState: Equatable {
-  var isNavigationActive = false
-  var optionalCounter: CounterState?
-}
+@Reducer
+struct EagerNavigation {
+  struct State: Equatable {
+    var isNavigationActive = false
+    var optionalCounter: Counter.State?
+  }
 
-enum EagerNavigationAction: Equatable {
-  case optionalCounter(CounterAction)
-  case setNavigation(isActive: Bool)
-  case setNavigationIsActiveDelayCompleted
-}
+  enum Action {
+    case optionalCounter(Counter.Action)
+    case setNavigation(isActive: Bool)
+    case setNavigationIsActiveDelayCompleted
+  }
 
-struct EagerNavigationEnvironment {
-  var mainQueue: AnySchedulerOf<DispatchQueue>
-}
+  private enum CancelID { case load }
+  @Dependency(\.continuousClock) var clock
 
-let eagerNavigationReducer =
-  counterReducer
-  .optional()
-  .pullback(
-    state: \.optionalCounter,
-    action: /EagerNavigationAction.optionalCounter,
-    environment: { _ in CounterEnvironment() }
-  )
-  .combined(
-    with: Reducer<
-      EagerNavigationState, EagerNavigationAction, EagerNavigationEnvironment
-    > { state, action, environment in
-
-      enum CancelId {}
-
+  var body: some Reducer<State, Action> {
+    Reduce { state, action in
       switch action {
       case .setNavigation(isActive: true):
         state.isNavigationActive = true
-        return Effect(value: .setNavigationIsActiveDelayCompleted)
-          .delay(for: 1, scheduler: environment.mainQueue)
-          .eraseToEffect()
-          .cancellable(id: CancelId.self)
+        return .run { send in
+          try await self.clock.sleep(for: .seconds(1))
+          await send(.setNavigationIsActiveDelayCompleted)
+        }
+        .cancellable(id: CancelID.load)
+
       case .setNavigation(isActive: false):
         state.isNavigationActive = false
         state.optionalCounter = nil
-        return .cancel(id: CancelId.self)
+        return .cancel(id: CancelID.load)
+
       case .setNavigationIsActiveDelayCompleted:
-        state.optionalCounter = CounterState()
+        state.optionalCounter = Counter.State()
         return .none
+
       case .optionalCounter:
         return .none
       }
     }
-  )
+    .ifLet(\.optionalCounter, action: \.optionalCounter) {
+      Counter()
+    }
+  }
+}
 
 class EagerNavigationViewController: UIViewController {
   var cancellables: [AnyCancellable] = []
-  let store: Store<EagerNavigationState, EagerNavigationAction>
-  let viewStore: ViewStore<EagerNavigationState, EagerNavigationAction>
+  let store: StoreOf<EagerNavigation>
 
-  init(store: Store<EagerNavigationState, EagerNavigationAction>) {
+  init(store: StoreOf<EagerNavigation>) {
     self.store = store
-    self.viewStore = ViewStore(store)
     super.init(nibName: nil, bundle: nil)
   }
 
@@ -86,20 +80,21 @@ class EagerNavigationViewController: UIViewController {
       button.centerYAnchor.constraint(equalTo: self.view.safeAreaLayoutGuide.centerYAnchor),
     ])
 
-    self.viewStore.publisher.isNavigationActive.sink { [weak self] isNavigationActive in
+    self.store.publisher.isNavigationActive.sink { [weak self] isNavigationActive in
       guard let self = self else { return }
       if isNavigationActive {
         self.navigationController?.pushViewController(
           IfLetStoreController(
-            store: self.store
-              .scope(state: \.optionalCounter, action: EagerNavigationAction.optionalCounter),
-            then: CounterViewController.init(store:),
-            else: ActivityIndicatorViewController.init
-          ),
+            self.store.scope(state: \.optionalCounter, action: { .optionalCounter($0) })
+          ) {
+            CounterViewController(store: $0)
+          } else: {
+            ActivityIndicatorViewController()
+          },
           animated: true
         )
       } else {
-        self.navigationController?.popToViewController(self, animated: true)
+        _ = self.navigationController?.popToViewController(self, animated: true)
       }
     }
     .store(in: &self.cancellables)
@@ -109,12 +104,12 @@ class EagerNavigationViewController: UIViewController {
     super.viewDidAppear(animated)
 
     if !self.isMovingToParent {
-      self.viewStore.send(.setNavigation(isActive: false))
+      self.store.send(.setNavigation(isActive: false))
     }
   }
 
   @objc private func loadOptionalCounterTapped() {
-    self.viewStore.send(.setNavigation(isActive: true))
+    self.store.send(.setNavigation(isActive: true))
   }
 }
 
@@ -122,13 +117,9 @@ struct EagerNavigationViewController_Previews: PreviewProvider {
   static var previews: some View {
     let vc = UINavigationController(
       rootViewController: EagerNavigationViewController(
-        store: Store(
-          initialState: EagerNavigationState(),
-          reducer: eagerNavigationReducer,
-          environment: EagerNavigationEnvironment(
-            mainQueue: .main
-          )
-        )
+        store: Store(initialState: EagerNavigation.State()) {
+          EagerNavigation()
+        }
       )
     )
     return UIViewRepresented(makeUIView: { _ in vc.view })
